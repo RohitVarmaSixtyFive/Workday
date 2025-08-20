@@ -4,8 +4,8 @@
     "first_name": "Lin",
     "last_name": "Mei",
     "title": "Software Engineer",
-    "email": "quantumfieldtheory123@gmail.com",
-    "password": "Password@123456",
+    "email": "lmei1121111@gmail.com",
+    "password": "Password@123",
     "phone": "6504508692",
     "location": "California, USA",
     "address": {
@@ -36,15 +36,13 @@
           "degree": "Master of Science in Computer Science",
           "university": "University of California, Davis",
           "location": "California, USA",
-          "graduation_year": 2018,
-          "GPA" : 3.4
+          "graduation_year": 2018
         },
         {
           "degree": "Bachelor of Engineering in Computer Science",
           "university": "University of Pune",
           "location": "Maharashtra, India",
-          "graduation_year": 2015,
-          "GPA" : 3.2
+          "graduation_year": 2015
         }
       ]
     }

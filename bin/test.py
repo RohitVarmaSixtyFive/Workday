@@ -115,53 +115,20 @@ async def main():
     bot = JobApplicationBot()
     
     try:
-        # Get authentication choice
-        print("Authentication Options:")
-        print("1. Sign In")
-        print("2. Sign Up")
+        # Get custom job URL
+        custom_url = input("Paste the job application URL: ").strip()
+        if not custom_url:
+            print("No URL provided, exiting...")
+            return
         
-        try:
-            auth_choice = int(input("Enter 1 for sign in or 2 for sign up: "))
-        except ValueError:
-            auth_choice = 1
-            print("Invalid input, defaulting to sign in")
-
-        # Get company choice
-        print("\nAvailable companies:")
-        company_list = list(bot.company_urls.keys())
-        for i, company in enumerate(company_list, 1):
-            print(f"{i}. {company.title()}")
-        print(f"{len(company_list) + 1}. Paste a new job URL")
-
-        try:
-            company_choice = int(input(f"Select company (1-{len(company_list) + 1}): "))
-            
-            if company_choice == len(company_list) + 1:
-                # Option to paste a new URL
-                custom_url = input("Paste the job application URL: ").strip()
-                if not custom_url:
-                    print("No URL provided, defaulting to Harris")
-                    selected_company = "harris"
-                else:
-                    # Add the custom URL to the bot's company_urls
-                    custom_company_name = "custom_job"
-                    bot.company_urls[custom_company_name] = custom_url
-                    selected_company = custom_company_name
-                    print(f"Using custom job URL: {custom_url}")
-            else:
-                selected_company = company_list[company_choice - 1]
-                
-        except (ValueError, IndexError):
-            selected_company = "harris"  # Default
-            print("Invalid input, defaulting to Harris")
+        # Add the custom URL to the bot's company_urls
+        custom_company_name = "custom_job"
+        bot.company_urls[custom_company_name] = custom_url
+        selected_company = custom_company_name
+        print(f"Using custom job URL: {custom_url}")
         
         # Set the company for proper logging
         bot.set_company(selected_company)
-        
-        if selected_company != "custom_job":
-            print(f"Selected company: {selected_company.title()}")
-        else:
-            print("Selected: Custom Job URL")
 
         print("\n=== Starting Job Application Automation ===")
 
@@ -170,12 +137,20 @@ async def main():
         await bot.initialize_browser(headless=False)
 
         # Navigate to job
-        print(f"Navigating to {selected_company} job page...")
+        print(f"Navigating to job page...")
         await bot.navigate_to_job(selected_company)
-
-        # Handle authentication
-        print("Handling authentication...")
-        auth_success = await bot.handle_authentication(auth_choice)
+        
+        # Additional steps for custom links before authentication
+        print("Waiting for page to load and clicking apply buttons...")
+        await bot.page.wait_for_load_state('networkidle')
+        await asyncio.sleep(0.5)
+        await bot.page.click('a[data-automation-id="adventureButton"]')
+        await asyncio.sleep(0.5)
+        await bot.page.click('a[data-automation-id="applyManually"]')
+        await bot.page.wait_for_load_state('networkidle')
+        # Handle authentication (sign up only)
+        print("Handling authentication (sign up)...")
+        auth_success = await bot.handle_authentication(2)  # 2 for sign up
         if not auth_success:
             print("Authentication failed, exiting...")
             return

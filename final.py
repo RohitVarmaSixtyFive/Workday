@@ -22,11 +22,12 @@ import openai
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 from dotenv import load_dotenv
 
+from ai_handler import AIResponseHandler
 
 class JobApplicationBot:
     """Main class for job application automation"""
     
-    def __init__(self, config_path: str = "data/user_profile.json"):
+    def __init__(self, config_path: str = "data/user_profile_temp.json"):
         """Initialize the job application bot
         
         Args:
@@ -36,9 +37,11 @@ class JobApplicationBot:
         self.config_path = config_path
         self.user_data = self._load_user_profile()
         self.client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.ai_handler = AIResponseHandler(self.client)  # Initialize AI handler
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
+        self.company: str = "unknown"  # Track current company
         
         # Application URLs for different companies
         self.company_urls = {
@@ -46,22 +49,60 @@ class JobApplicationBot:
             "salesforce": "https://salesforce.wd12.myworkdayjobs.com/en-US/External_Career_Site/job/Singapore---Singapore/Senior-Manager--Solution-Engineering--Philippines-_JR301876/apply/applyManually",
             "hitachi": "https://hitachi.wd1.myworkdayjobs.com/en-US/hitachi/job/Alamo%2C-Tennessee%2C-United-States-of-America/Project-Engineer_R0102918/apply/applyManually",
             "icf": "https://icf.wd5.myworkdayjobs.com/en-US/ICFExternal_Career_Site/job/Reston%2C-VA/Senior-Paid-Search-Manager_R2502057/apply/applyManually",
-            "harris": "https://harriscomputer.wd3.myworkdayjobs.com/en-US/1/job/Florida%2C-United-States/Vice-President-of-Sales_R0030918/apply/applyManually"
+            "harris": "https://harriscomputer.wd3.myworkdayjobs.com/en-US/1/job/Florida%2C-United-States/Vice-President-of-Sales_R0030918/apply/applyManually",
+            "walmart": "https://walmart.wd5.myworkdayjobs.com/en-US/WalmartExternal/job/Sherbrooke%2C-QC/XMLNAME--CAN--Self-Checkout-Attendant_R-2263567-1/apply/applyManually"
         }
         
-        # Logging setup
+        # Logging setup with company name and incrementing counter
         self.logs_dir = Path("logs")
         self.logs_dir.mkdir(exist_ok=True)
-        self.current_run_dir = self.logs_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.run_number = self._get_next_run_number()
+        self.current_run_dir = self.logs_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.company}_{self.run_number:03d}"
         self.current_run_dir.mkdir(exist_ok=True)
-        
+        self.url = None  # Store the current job URL
         # Track the previous question and whether it was a listbox
         self.previous_question = None
         self.previous_was_listbox = False
         
         # Data collection for final JSON output
         self.application_data = []
+        self.extracted_elements = []  # Store all extracted elements
+        self.filled_elements = []     # Store elements with responses
+        
+        # Timing profiling for questions
+        self.question_timings = {}  # Store timing data for each question
+        self.current_question_start_times = {}  # Track when questions are first identified
 
+    def _get_next_run_number(self) -> int:
+        """Get the next run number for the current company"""
+        try:
+            existing_runs = list(self.logs_dir.glob(f"*_{self.company}_*"))
+            if not existing_runs:
+                return 1
+            
+            # Extract numbers from existing run directories
+            run_numbers = []
+            for run_dir in existing_runs:
+                parts = run_dir.name.split('_')
+                if len(parts) >= 3 and parts[-2] == self.company:
+                    try:
+                        run_numbers.append(int(parts[-1]))
+                    except ValueError:
+                        continue
+            
+            return max(run_numbers, default=0) + 1
+        except Exception:
+            return 1
+
+    def set_company(self, company: str) -> None:
+        """Set the company for this application session"""
+        self.company = company
+        # Recreate the run directory with the company name
+        self.run_number = self._get_next_run_number()
+        self.current_run_dir = self.logs_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.company}_{self.run_number:03d}"
+        self.current_run_dir.mkdir(exist_ok=True)
+        print(f"Set company to {company}, run directory: {self.current_run_dir}")
+        
     def _load_user_profile(self) -> Dict[str, Any]:
         """Load user profile data from JSON file"""
         try:
@@ -79,6 +120,76 @@ class JobApplicationBot:
         self.previous_question = None
         self.previous_was_listbox = False
         print("Reset duplicate question tracking")
+
+    def _start_question_timing(self, question: str, question_id: str = None) -> None:
+        """Record when a question is first identified/seen"""
+        if not question or question == "UNLABELED":
+            return
+            
+        # Create a unique key for the question
+        timing_key = f"{question_id}_{question}" if question_id else question
+        
+        if timing_key not in self.current_question_start_times:
+            start_time = datetime.now()
+            self.current_question_start_times[timing_key] = start_time
+            print(f"[TIMING] Question identified at {start_time.strftime('%H:%M:%S.%f')[:-3]}: {question}")
+
+    def _end_question_timing(self, question: str, question_id: str = None, response: Any = None) -> None:
+        """Record when a question is filled and calculate the time taken"""
+        if not question or question == "UNLABELED":
+            return
+            
+        # Create the same unique key used in start timing
+        timing_key = f"{question_id}_{question}" if question_id else question
+        
+        if timing_key in self.current_question_start_times:
+            start_time = self.current_question_start_times[timing_key]
+            end_time = datetime.now()
+            duration = end_time - start_time
+            duration_ms = duration.total_seconds() * 1000
+            
+            # Store timing data
+            self.question_timings[timing_key] = {
+                "question": question,
+                "question_id": question_id,
+                "start_time": start_time.isoformat(),
+                "end_time": end_time.isoformat(),
+                "duration_ms": round(duration_ms, 2),
+                "duration_readable": f"{duration_ms/1000:.2f}s",
+                "response": str(response) if response and response != "SKIP" else None
+            }
+            
+            # Clean up the start time tracking
+            del self.current_question_start_times[timing_key]
+            
+            print(f"[TIMING] Question filled at {end_time.strftime('%H:%M:%S.%f')[:-3]}: {question} (took {duration_ms/1000:.2f}s)")
+        else:
+            print(f"[TIMING WARNING] No start time recorded for question: {question}")
+
+    def get_timing_summary(self) -> Dict[str, Any]:
+        """Get a summary of all question timings"""
+        if not self.question_timings:
+            return {"total_questions": 0, "total_time_ms": 0, "average_time_ms": 0, "timings": []}
+        
+        total_time = sum(timing["duration_ms"] for timing in self.question_timings.values())
+        avg_time = total_time / len(self.question_timings)
+        
+        # Sort timings by start time
+        sorted_timings = sorted(
+            self.question_timings.values(),
+            key=lambda x: x["start_time"]
+        )
+        
+        return {
+            "total_questions": len(self.question_timings),
+            "total_time_ms": round(total_time, 2),
+            "total_time_readable": f"{total_time/1000:.2f}s",
+            "average_time_ms": round(avg_time, 2),
+            "average_time_readable": f"{avg_time/1000:.2f}s",
+            "fastest_question_ms": min(timing["duration_ms"] for timing in self.question_timings.values()),
+            "slowest_question_ms": max(timing["duration_ms"] for timing in self.question_timings.values()),
+            "timings": sorted_timings
+        }
 
     async def initialize_browser(self, headless: bool = False, slow_mo: int = 100) -> None:
         """Initialize browser and page"""
@@ -98,19 +209,47 @@ class JobApplicationBot:
             raise ValueError(f"Company '{company}' not supported. Available: {list(self.company_urls.keys())}")
         
         url = self.company_urls[company]
+        self.url = url  # Store URL for later use
         await self.page.goto(url, wait_until='networkidle', timeout=30000)
         print(f"Navigated to {company} job application page")
 
     async def handle_authentication(self, auth_type: int = 1) -> bool:
-        """Handle authentication (sign in or sign up)
+        """Handle authentication - tries signup first, then falls back to signin if needed.
         
         Args:
-            auth_type: 1 for sign in, 2 for sign up
+            auth_type: 1 for sign in, 2 for sign up (legacy parameter, now tries signup first regardless).
         """
-        if auth_type == 2:
-            return await self._handle_signup()
-        else:
-            return await self._handle_signin()
+        try:
+            # First, try signup
+            print("Attempting signup first...")
+            signup_success = await self._handle_signup()
+            
+            # await till networkidle
+            await self.page.wait_for_load_state('networkidle')
+            
+            await asyncio.sleep(10)
+            print("Waited for sign up to work")
+            # Check if email and password fields are still present (indicating signup failed/needs signin)
+            email_input = await self.page.query_selector('input[data-automation-id="email"]')
+            password_input = await self.page.query_selector('input[data-automation-id="password"]')
+            
+            if email_input and password_input:
+                # Fields are still there, try signin instead
+                print("Email and password fields still present, attempting signin...")
+                return await self._handle_signin()
+            else:
+                # Fields are gone, signup was successful
+                print("Signup appears to be successful")
+                return True
+                
+        except Exception as e:
+            print(f"Error during authentication: {e}")
+            # Fallback to signin if anything goes wrong
+            try:
+                return await self._handle_signin()
+            except Exception as signin_error:
+                print(f"Error during signin fallback: {signin_error}")
+                return False
 
     async def _handle_signup(self) -> bool:
         """Handle user sign up process"""
@@ -141,6 +280,7 @@ class JobApplicationBot:
             checkbox = await self.page.query_selector('input[data-automation-id="createAccountCheckbox"]')
             if checkbox:
                 checked = await checkbox.is_checked()
+                await asyncio.sleep(1)
                 if not checked:
                     await checkbox.check()
                 print("Checked create account checkbox")
@@ -273,7 +413,7 @@ class JobApplicationBot:
                 'input_id': f"radio_group_{input_id}"
             }
             
-            ai_values, _ = await self._get_ai_response_without_skipping(
+            ai_values, _ = await self.ai_handler.get_ai_response_without_skipping(
                 self.user_data.get('personal_information', {}), 
                 [element_info]
             )
@@ -319,7 +459,7 @@ class JobApplicationBot:
             
             for radio_index in radio_indices:
                 radio_el = inputs[radio_index]
-                option_label = await self._get_nearest_label_text(radio_el) or f'Option {len(options) + 1}'
+                option_label = await self._get_radio_option_label(radio_el)
                 options.append(option_label)
                 radio_elements.append(radio_el)
             
@@ -341,7 +481,7 @@ class JobApplicationBot:
             # Get AI response for the entire radio group
             full_key = f"[{group_question}, {element_info['input_id']}, radio_group, {aria_labelledby}, radio_group]"
             
-            ai_values, _ = await self._get_ai_response_without_skipping(
+            ai_values, _ = await self.ai_handler.get_ai_response_without_skipping(
                 self.user_data.get('personal_information', {}), 
                 [element_info]
             )
@@ -450,7 +590,8 @@ class JobApplicationBot:
                 continue
             
             print("--------------------------------")
-            print(f"Processing element {i}: Input ID: {input_id}, Question: {question}, Type: {input_type}")
+            print(f"Processing element {i}: Input ID: {input_id}, Question: {question}, Type: {input_type}", 
+                  f"Role: {role}, Placeholder: {placeholder}, Required: {required}")
             
             # Process other form elements one by one
             if role == "spinbutton":
@@ -473,6 +614,10 @@ class JobApplicationBot:
             
             print(f"Processing form element: {question}")
             
+            # Start timing for this question when it's identified
+            if question and question != "UNLABELED":
+                self._start_question_timing(question, input_id)
+            
             # Create element info for AI processing
             element_info = {
                 'question': question or 'UNLABELED',
@@ -488,7 +633,7 @@ class JobApplicationBot:
             
             # Get AI response for this single element
             full_key = f"[{element_info['question']}, {element_info['input_id']}, {element_info['input_type']}, {element_info['aria_labelledby']}, {element_info['input_tag']}]"
-            ai_values, _ = await self._get_ai_response_for_section_for_personal_information(
+            ai_values, _ = await self.ai_handler.get_ai_response_for_personal_information(
                 self.user_data.get('personal_information', {}), 
                 [element_info]
             )
@@ -519,11 +664,19 @@ class JobApplicationBot:
 
     async def _process_later_sections(self, section) -> None:
         """Process personal information section with radio/checkbox group handling"""
-        print("Processing Personal Information section")
-        
+        print("Processing later sections")
+
         await asyncio.sleep(5)  # Wait for page to load
         
         main_page = await self.page.query_selector('div[data-automation-id="applyFlowPage"]')
+        
+        # Check for disability status fieldset first
+        disability_status_group = await self.page.query_selector('fieldset[data-automation-id="disabilityStatus-CheckboxGroup"]')
+        if disability_status_group:
+            print("Found disability status checkbox group in later sections, using specialized handler")
+            await self._handle_disability_status_checkboxes(disability_status_group)
+            await asyncio.sleep(0.5)  # Wait after handling
+        
         INPUT_SELECTOR = 'button, input, select, textarea, [role="button"]'
         
         i = 0
@@ -533,7 +686,11 @@ class JobApplicationBot:
         while True:
             # Re-extract elements on each iteration (fresh DOM state)
             inputs = await main_page.query_selector_all(INPUT_SELECTOR)
-            
+            # for input_el in inputs:
+            #     input_type = await input_el.get_attribute('type')
+            #     input_id = await input_el.get_attribute('data-automation-id') or await input_el.get_attribute('aria-haspopup') or 'unknown'
+            #     print(f"Input_id :{input_id}  Input type: {input_type}")
+                
             if i >= len(inputs):
                 print("Reached end of inputs, exiting loop")
                 break
@@ -560,6 +717,10 @@ class JobApplicationBot:
                 print("Found Next button")
                 break
 
+            if disability_status_group and input_type == "checkbox":
+                i+=1
+                continue
+            
             # Process other elements normally
             group_label, aria_labelledby = await self._get_group_label_and_aria(input_el)
             question = await self._get_nearest_label_text(input_el) or group_label or 'UNLABELED'
@@ -604,6 +765,14 @@ class JobApplicationBot:
                     print(f"Filled date field {input_id} with: {response}")
                     i += 1
                     continue
+            
+            # disability_status = await main_page.query_selector('div[data-automation-id="formField-disabilityStatus"]')
+            # if disability_status:
+            #     print("Disability status section found, handling with special method")
+            #     await self.handle_disability_status_checkboxes(disability_status)
+            #     continue
+            # print("Disability status section not found continue with regular processing")      
+               
             print(f"Previous question: {prev_answered_question}, Current question: {question}, previous type : {prev_type}, current_role : {role}")
             # Skip duplicate questions
             if question != 'UNLABELED' and question == prev_answered_question and role != "spinbutton" and prev_type == "button":
@@ -635,6 +804,10 @@ class JobApplicationBot:
             
             print(f"Processing form element: {question}")
             
+            # Start timing for this question when it's identified
+            if question and question != "UNLABELED":
+                self._start_question_timing(question, input_id)
+            
             # Create element info for AI processing
             element_info = {
                 'question': question or 'UNLABELED',
@@ -650,7 +823,7 @@ class JobApplicationBot:
             
             # Get AI response for this single element
             full_key = f"[{element_info['question']}, {element_info['input_id']}, {element_info['input_type']}, {element_info['aria_labelledby']}, {element_info['input_tag']}]"
-            ai_values, _ = await self._get_ai_response_without_skipping(
+            ai_values, _ = await self.ai_handler.get_ai_response_without_skipping(
                 self.user_data.get('personal_information', {}), 
                 [element_info]
             )
@@ -713,7 +886,7 @@ class JobApplicationBot:
         }
         
         # Use AI to map and fill the form
-        ai_response, key_mapping = await self._get_ai_response_for_section(skills_data, form_elements)
+        ai_response, key_mapping = await self.ai_handler.get_ai_response_for_section(skills_data, form_elements)
         
         # Fill the form elements
         await self._fill_form_elements(ai_response, key_mapping)
@@ -820,6 +993,13 @@ class JobApplicationBot:
         """Process disability disclosure section"""
         print("Processing Disability section")
         
+        # Check if this is the special disability status checkbox group
+        disability_status_group = await section.query_selector('fieldset[data-automation-id="disabilityStatus-CheckboxGroup"]')
+        if disability_status_group:
+            print("Found disability status checkbox group, using specialized handler")
+            await self._handle_disability_status_checkboxes(disability_status_group)
+            return
+        
         log_data = {'checkboxes': [], 'date_fields': []}
         
         # Find checkboxes
@@ -869,10 +1049,93 @@ class JobApplicationBot:
         log_path = self.current_run_dir / "disability_disclosures.json"
         with open(log_path, 'w') as f:
             json.dump(log_data, f, indent=2)
+    
+    async def _handle_disability_status_checkboxes(self, checkbox_group) -> None:
+        """Handle the disability status checkbox group that requires exactly one selection"""
+        print("Processing disability status checkbox group")
+        
+        # Find all checkboxes in the group
+        checkboxes = await checkbox_group.query_selector_all('input[type="checkbox"]')
+        
+        if not checkboxes or len(checkboxes) == 0:
+            print("No checkboxes found in disability status group")
+            return
+            
+        print(f"Found {len(checkboxes)} disability status checkboxes")
+        
+        # Choose which option to select (option index 2 = "I do not want to answer")
+        # Options are typically:
+        # 0: Yes, I have a disability
+        # 1: No, I do not have a disability
+        # 2: I do not want to answer
+        selected_option = 1
+        
+        try:
+            # First uncheck all boxes to avoid conflicts
+            for i, checkbox in enumerate(checkboxes):
+                is_checked = await checkbox.is_checked()
+                if is_checked:
+                    print(f"Unchecking checkbox {i}")
+                    await checkbox.uncheck()
+                    await asyncio.sleep(1)  # Wait for UI to update
+            
+            # Now check the desired option if we have enough options
+            if selected_option < len(checkboxes):
+                checkbox = checkboxes[selected_option]
+                
+                # Try to get the label for better logging
+                try:
+                    label = await checkbox.evaluate('(el) => { const label = document.querySelector(`label[for="${el.id}"]`); return label ? label.textContent : "Unknown"; }')
+                    print(f"Selecting disability option: {label}")
+                except Exception:
+                    print(f"Selecting disability option {selected_option}")
+                
+                # Check the checkbox with retry logic
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        await checkbox.check()
+                        await asyncio.sleep(0.5)  # Longer wait for page to stabilize
+                        
+                        # Verify it's checked
+                        is_checked = await checkbox.is_checked()
+                        if is_checked:
+                            print(f"Successfully selected disability option {selected_option}")
+                            # Verify other checkboxes are unchecked
+                            all_others_unchecked = True
+                            for i, other_checkbox in enumerate(checkboxes):
+                                if i != selected_option:
+                                    if await other_checkbox.is_checked():
+                                        all_others_unchecked = False
+                                        print(f"Warning: Checkbox {i} is still checked!")
+                            
+                            if all_others_unchecked:
+                                print("All other checkboxes are properly unchecked")
+                            break
+                        else:
+                            print(f"Attempt {attempt+1}: Failed to check the checkbox")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(1)
+                    except Exception as e:
+                        print(f"Attempt {attempt+1} error: {str(e)}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(1)
+            else:
+                print(f"Selected option {selected_option} is out of range (only {len(checkboxes)} checkboxes found)")
+                
+        except Exception as e:
+            print(f"Error handling disability status checkboxes: {str(e)}")
 
     async def _process_generic_section(self, section, section_name: str, data=None) -> None:
         """Process any generic section using AI"""
         print(f"Processing Generic section: {section_name}")
+        
+        # Check for disability status fieldset first
+        disability_status_group = await section.query_selector('fieldset[data-automation-id="disabilityStatus-CheckboxGroup"]')
+        if disability_status_group:
+            print(f"Found disability status checkbox group in {section_name}, using specialized handler")
+            await self._handle_disability_status_checkboxes(disability_status_group)
+            return
         
         # Extract form elements from this section
         form_elements = await self._extract_form_elements_from_section(section)
@@ -883,7 +1146,7 @@ class JobApplicationBot:
         if data == None:
             data = self.user_data
         # Use entire user data for unknown sections
-        ai_response, key_mapping = await self._get_ai_response_for_section(data, form_elements)
+        ai_response, key_mapping = await self.ai_handler.get_ai_response_for_section(data, form_elements)
 
         # Fill the form elements
         await self._fill_form_elements(ai_response, key_mapping)
@@ -904,17 +1167,18 @@ class JobApplicationBot:
         
         if not items_data:
             return
-            
+        previous_aria_label_section_number = None
         # Process each item
         for i, item_data in enumerate(items_data):
             print(f"\n=== Filling {section_type} {i + 1} ===")
             
             # Click add button for each entry
             add_button = await section.query_selector('button[data-automation-id="add-button"]')
-            if add_button:
+            if add_button and (previous_aria_label_section_number == None or previous_aria_label_section_number < f"{len(items_data)}-panel"):
                 await add_button.click()
                 await asyncio.sleep(2)
                 print(f"Clicked add button for {section_type} {i + 1}")
+                previous_aria_label_section_number = f"{len(items_data)}-panel"
             
             inputs = await section.query_selector_all('input, button, textarea, select')
             panel_elements = []
@@ -945,7 +1209,7 @@ class JobApplicationBot:
                     question == previous_question and 
                     previous_type == "button" and 
                     input_id != "file-upload-input-ref"):
-                    print(f"Skipping duplicate question: '{question}'")
+                    print(f"Skipping duplicate question: '{question}', previous type was '{previous_type}'")
                     continue
 
                 input_tag = await input_el.evaluate("(el) => el.tagName.toLowerCase()")
@@ -975,6 +1239,8 @@ class JobApplicationBot:
                     previous_question = question
                     previous_type = input_type
 
+            
+            
             if panel_elements:
                 print(f"Panel Elements Count: {len(panel_elements)}")
                 for field in panel_elements:
@@ -983,7 +1249,7 @@ class JobApplicationBot:
                     print(f"Element: {field['question']}, Type: {input_type}, Options: {options}")
 
                 # Get AI response with complete element information
-                ai_values, key_mapping = await self._get_ai_response_for_section(item_data, panel_elements)
+                ai_values, key_mapping = await self.ai_handler.get_ai_response_for_section(item_data, panel_elements)
                 print("AI Response:", ai_values)
 
                 # Fill all elements with validation
@@ -1013,7 +1279,7 @@ class JobApplicationBot:
                         
                         if group_key not in radio_groups:
                             radio_groups[group_key] = {
-                                'question': await self._get_radio_group_question(input_el),
+                                'question': element_info['question'],  # Use the group question from element_info
                                 'input_type': 'radio_group',
                                 'input_tag': 'radio_group',
                                 'options': [],
@@ -1021,8 +1287,8 @@ class JobApplicationBot:
                                 'input_id': f"radio_group_{group_key}"
                             }
                         
-                        # Add this radio option to the group
-                        option_label = element_info['question']  # This is actually the option label
+                        # Add this radio option to the group using the specific option label
+                        option_label = element_info.get('option_label', 'Unknown Option')
                         radio_groups[group_key]['options'].append(option_label)
                         radio_groups[group_key]['elements'].append(input_el)
                         continue
@@ -1157,6 +1423,26 @@ class JobApplicationBot:
             question = await self._get_nearest_label_text(input_el)
             group_label, aria_labelledby = await self._get_group_label_and_aria(input_el)
             
+            # Special handling for radio buttons
+            if input_type == 'radio':
+                # For radio buttons, get both group question and specific option label
+                group_question = question or group_label or 'UNLABELED'
+                option_label = await self._get_radio_option_label(input_el)
+                
+                return {
+                    'element': input_el,
+                    'question': group_question,  # e.g., "Gender"
+                    'option_label': option_label,  # e.g., "Male", "Female", etc.
+                    'input_id': input_id,
+                    'input_type': input_type,
+                    'input_tag': input_tag,
+                    'aria_labelledby': aria_labelledby,
+                    'options': None,
+                    'placeholder': None,
+                    'required': await input_el.get_attribute('aria-required'),
+                    'role': await input_el.get_attribute('role')
+                }
+            
             # Get options for dropdown elements
             options = await self._get_element_options(input_el, input_tag, input_type)
             
@@ -1186,36 +1472,20 @@ class JobApplicationBot:
         """Get the nearest label text for a form element"""
 
         try:
-
-            # Try multiple methods to find the label
-            element_id = await element.get_attribute('id')
-            if element_id and element_id != "unknown":
-                label_elem = await self.page.query_selector(f'label[for="{element_id}"]')
-                if label_elem:
-                    label_text = await label_elem.text_content()
-                    if label_text:
-                        print("Found label by ID:", label_text)
-                        return label_text.replace('*', '').strip()
-            
-            # Try parent label
-            parent_label_handle = await element.evaluate_handle('el => el.closest("label")')
-            parent_label = parent_label_handle.as_element() if parent_label_handle else None
-            if parent_label:
-                label_text = await parent_label.text_content()
-                if label_text:
-                    print("Found label by parent label:", label_text)
-                    return label_text.replace('*', '').strip()
-            
-            # Try form field label
+            # PRIORITY 1: Try form field container label (most reliable for this structure)
             form_field_label = await element.evaluate('''
                 el => {
+                    // First, try to find the immediate formField container
                     let cur = el.parentElement;
                     let depth = 0;
-                    while (cur && depth < 15) {
+                    while (cur && depth < 10) {
                         if (cur.tagName.toLowerCase() === "div" &&
                             cur.getAttribute("data-automation-id")?.startsWith("formField-")) {
-                            const lbl = cur.querySelector("label span, label");
-                            if (lbl && lbl.textContent) return lbl.textContent.trim();
+                            // Found the form field container, now find its label
+                            const lbl = cur.querySelector("label");
+                            if (lbl && lbl.textContent) {
+                                return lbl.textContent.trim();
+                            }
                         }
                         cur = cur.parentElement;
                         depth++;
@@ -1224,10 +1494,45 @@ class JobApplicationBot:
                 }
             ''')
             if form_field_label:
-                print("Found label by form field:", form_field_label)
+                print("Found label by form field container:", form_field_label)
                 return form_field_label.replace('*', '').strip()
+
+            # PRIORITY 2: Try label that correctly references this element's ID
+            element_id = await element.get_attribute('id')
+            if element_id and element_id != "unknown":
+                # Make sure the label's 'for' attribute matches exactly AND the element is in the same form field
+                correct_label = await element.evaluate(f'''
+                    el => {{
+                        // Find all labels with matching 'for' attribute
+                        const labels = document.querySelectorAll('label[for="{element_id}"]');
+                        
+                        // Check each label to see if it's in the same form field container as this element
+                        for (let label of labels) {{
+                            let labelContainer = label.closest('[data-automation-id^="formField-"]');
+                            let elementContainer = el.closest('[data-automation-id^="formField-"]');
+                            
+                            // If both are in the same container, this is the correct label
+                            if (labelContainer && elementContainer && labelContainer === elementContainer) {{
+                                return label.textContent ? label.textContent.trim() : null;
+                            }}
+                        }}
+                        return null;
+                    }}
+                ''')
+                if correct_label:
+                    print("Found correct label by ID match in same container:", correct_label)
+                    return correct_label.replace('*', '').strip()
             
-            # Try aria-labelledby
+            # PRIORITY 3: Try parent label
+            parent_label_handle = await element.evaluate_handle('el => el.closest("label")')
+            parent_label = parent_label_handle.as_element() if parent_label_handle else None
+            if parent_label:
+                label_text = await parent_label.text_content()
+                if label_text:
+                    print("Found label by parent label:", label_text)
+                    return label_text.replace('*', '').strip()
+            
+            # PRIORITY 4: Try aria-labelledby
             aria_labelledby = await element.get_attribute('aria-labelledby')
             if aria_labelledby:
                 label_element = await self.page.query_selector(f'#{aria_labelledby}')
@@ -1237,7 +1542,7 @@ class JobApplicationBot:
                         print("Found label by aria-labelledby:", label_text)
                         return label_text.replace('*', '').strip()
             
-            # Try fieldset legend
+            # PRIORITY 5: Try fieldset legend
             fieldset_legend = await element.evaluate('''
                 el => {
                     let fieldset = el.closest("fieldset");
@@ -1254,13 +1559,13 @@ class JobApplicationBot:
             if fieldset_legend:
                 return fieldset_legend.replace('*', '').strip()
 
-            # Try aria-label
+            # PRIORITY 6: Try aria-label
             aria_label = await element.get_attribute('aria-label')
             if aria_label:
                 print("Found label by aria-label:", aria_label)
                 return aria_label.replace('*', '').strip()
             
-            # Try placeholder as fallback
+            # PRIORITY 7: Try placeholder as fallback
             placeholder = await element.get_attribute('placeholder')
             if placeholder:
                 print("Found label by placeholder:", placeholder)
@@ -1359,292 +1664,100 @@ class JobApplicationBot:
         except:
             return []
 
-    async def _get_ai_response_without_skipping(self, current_data: Dict[str, Any], panel_elements: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Get AI response for form fields using OpenAI"""
+    async def _get_radio_option_label(self, radio_element) -> str:
+        """Get the specific option label for a radio button (not the group label)"""
         try:
-            form_fields = []
-            key_mapping = {}
-
-            for el in panel_elements:
-                full_key = f"[{el['question']}, {el['input_id']}, {el['input_type']}, {el['aria_labelledby']}, {el['input_tag']}]"
+            # Method 1: Check for direct label associated with this specific radio
+            # This is the most reliable method for the Workday structure
+            radio_id = await radio_element.get_attribute('id')
+            if radio_id:
+                # Look for label with for attribute pointing to this radio
+                specific_label = await self.page.query_selector(f'label[for="{radio_id}"]')
+                if specific_label:
+                    label_text = await specific_label.inner_text()
+                    if label_text and label_text.strip():
+                        print(f"Found radio option label by ID '{radio_id}': {label_text.strip()}")
+                        return label_text.strip()
+            
+            # Method 2: Look for nearby label in the same radio container
+            # This handles cases where the structure is slightly different
+            container_label = await radio_element.evaluate("""
+                (element) => {
+                    // Look for a label element in the same immediate container
+                    let parent = element.parentElement;
+                    if (parent) {
+                        // First check immediate parent for label
+                        let label = parent.querySelector('label:not([id])');
+                        if (label && label.textContent && label.textContent.trim()) {
+                            return label.textContent.trim();
+                        }
+                        
+                        // Check parent's parent (one level up)
+                        let grandParent = parent.parentElement;
+                        if (grandParent) {
+                            let grandLabel = grandParent.querySelector('label:not([id])');
+                            if (grandLabel && grandLabel.textContent && grandLabel.textContent.trim()) {
+                                return grandLabel.textContent.trim();
+                            }
+                        }
+                    }
+                    return '';
+                }
+            """)
+            
+            if container_label and container_label.strip():
+                print(f"Found radio option label by container: {container_label.strip()}")
+                return container_label.strip()
+            
+            # Method 3: Look for text in sibling elements
+            try:
+                sibling_text = await radio_element.evaluate("""
+                    (element) => {
+                        const nextSibling = element.nextElementSibling;
+                        if (nextSibling && nextSibling.textContent) {
+                            let text = nextSibling.textContent.trim();
+                            if (text && text.length < 50) {
+                                return text;
+                            }
+                        }
+                        
+                        const prevSibling = element.previousElementSibling;
+                        if (prevSibling && prevSibling.textContent) {
+                            let text = prevSibling.textContent.trim();
+                            if (text && text.length < 50) {
+                                return text;
+                            }
+                        }
+                        
+                        return '';
+                    }
+                """)
                 
-                form_fields.append({
-                    "full_key": full_key,
-                    "question": el['question'],
-                    "input_id": el['input_id'],
-                    "input_type": el['input_type'],
-                    "input_tag": el['input_tag'],
-                    "aria_labelledby": el['aria_labelledby'],
-                    "options": el['options'], 
-                    "placeholder": el.get('placeholder'),
-                    "required": el.get('required'),
-                    "role": el.get('role')
-                })
+                if sibling_text and len(sibling_text) < 50:
+                    print(f"Found radio option label by sibling: {sibling_text}")
+                    return sibling_text
+                    
+            except:
+                pass
+            
+            # Method 4: Get value attribute as fallback
+            value = await radio_element.get_attribute('value')
+            if value and value != 'on':
+                # Convert common values to readable text
+                if value.lower() == 'true':
+                    return 'Yes'
+                elif value.lower() == 'false':
+                    return 'No'
+                else:
+                    print(f"Found radio option label by value: {value}")
+                    return value
                 
-                key_mapping[full_key] = el
-
-            prompt = f"""
-You are helping fill a job application form.
-You are mapping user profile data to a web job application form.
-
-You are given:
-- An Entry from user profile data (JSON)
-- A list of form fields from the application panel (including labels, field types, and available options if there is dropdown for the element)
-
-Return a JSON dictionary mapping the EXACT "full_key" values to appropriate values. Use the user data to fill the values. 
-do not SKIP any field in the my information section, fill up the most accurate response you can come up with based on user profile
-
-CRITICAL: You MUST use the EXACT "full_key" value as the key in your response JSON. Do NOT use just the question text.
-
-IMPORTANT RULES:
-- Donot skip the elements give the best possible answer, if the question is ambgious or not in user profile data then give an answer that yields highest probability of the application passing. Especially for listboxes, textfields and radio/checkboxes in the application,voluntary disclosures section
-- For radio_group fields:
-  - You MUST select ONLY necessary options from the provided options list
-  - Choose the option that best matches the user's profile. If the question is have you worked at the company before, the answer is no so respond accoringly based on question and radio option
-  - Use EXACT text from the options list (case-sensitive)
-- For salary fields, just print a single number as expectation
-- For the country phone code under multiinputcontainer(as a button). Output the country name not the phone code as it fills automatically.
-- For fields with "options" not None:
-  - You MUST select ONLY from the list of provided OPTIONS (case-sensitive)
-  - If the user data is longer (e.g., "Bachelor of Engineering in Computer Science") and options are shorter (e.g., "BS"), choose the CLOSEST MATCH based on meaning
-- For text fields: Keep responses concise and relevant
-- Match options exactly as they appear in the options list (case-sensitive) when options is not None
-- After filling the form, if a field for save and continue is present, respond with yes to save the form
-
-SPECIAL HANDLING FOR SKILLS/MULTI-VALUE FIELDS:
-- For fields related to skills, technologies, competencies, or any field that should contain multiple items:
-  - Return an ARRAY of strings instead of a single comma-separated string
-  - Each skill/technology should be a separate string in the array
-  - Example: ["C#", "TypeScript", "Java", "SQL", "HTML5", "CSS3", "Python"] instead of "C#, TypeScript, Java, SQL, HTML5, CSS3, Python"
-- Identify skills fields by keywords in the question like: "skills", "technologies", "competencies", "tools", "programming languages", etc.
-
-Data from User Profile:
-{json.dumps(current_data, indent=2)}
-
-Form Fields:
-{json.dumps(form_fields, indent=2)}
-
-Example response format:
-{{
-  "[School or University*, unknown, text, Education-(Optional)-2-panel, input]": "University Name",
-  "[Degree*, unknown, button, Education-(Optional)-2-panel, button]": "MS",
-  "[Field of Study, unknown, unknown, Education-(Optional)-2-panel, input]": "Computer Science",
-  "[Type to Add Skills, unknown, unknown, Skills-section, input]": ["C#", "TypeScript", "Java", "SQL", "HTML5", "CSS3", "Python", ".NET Core", "Angular 2+", "RxJS", "Entity Framework", "React", "Redux", "Bootstrap 4"]
-}}
-
-Respond ONLY with a valid JSON object using the exact "full_key" values as keys.
-"""
-            
-            response = await self.client.chat.completions.create(
-                model="o4-mini",
-                messages=[{"role": "user", "content": prompt}]
-            )
-            content = response.choices[0].message.content.strip()
-            
-            # Clean up the response to extract JSON
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.endswith("```"):
-                content = content[:-3]
-            
-            ai_response = json.loads(content)
-            return ai_response, key_mapping
+            print(f"Could not find radio option label, using fallback")
+            return "Unknown Option"
             
         except Exception as e:
-            print(f"Error in get_ai_response_for_section: {e}")
-            return {}, {}
-
-    async def _get_ai_response_for_section_for_personal_information(self, current_data: Dict[str, Any], panel_elements: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Get AI response for form fields using OpenAI"""
-        try:
-            form_fields = []
-            key_mapping = {}
-
-            for el in panel_elements:
-                full_key = f"[{el['question']}, {el['input_id']}, {el['input_type']}, {el['aria_labelledby']}, {el['input_tag']}]"
-                
-                form_fields.append({
-                    "full_key": full_key,
-                    "question": el['question'],
-                    "input_id": el['input_id'],
-                    "input_type": el['input_type'],
-                    "input_tag": el['input_tag'],
-                    "aria_labelledby": el['aria_labelledby'],
-                    "options": el['options'], 
-                    "placeholder": el.get('placeholder'),
-                    "required": el.get('required'),
-                    "role": el.get('role')
-                })
-                
-                key_mapping[full_key] = el
-
-            prompt = f"""
-You are helping fill a job application form.
-You are mapping user profile data to a web job application form.
-
-You are given:
-- An Entry from user profile data (JSON)
-- A list of form fields from the application panel (including labels, field types, and available options if there is dropdown for the element)
-
-Return a JSON dictionary mapping the EXACT "full_key" values to appropriate values. Use the user data to fill the values. 
-do not SKIP any field in the my information section, fill up the most accurate response you can come up with based on user profile
-
-CRITICAL: You MUST use the EXACT "full_key" value as the key in your response JSON. Do NOT use just the question text.
-
-IMPORTANT RULES:
-- For radio_group fields:
-  - You MUST select ONLY necessary options from the provided options list
-  - Choose the option that best matches the user's profile. If the question is have you worked at the company before, the answer is no so respond accoringly based on question and radio option
-  - Use EXACT text from the options list (case-sensitive)
-- For the country phone code under multiinputcontainer(as a button). Output the country name not the phone code as it fills automatically.
-- For fields with "options" not None:
-  - You MUST select ONLY from the list of provided OPTIONS (case-sensitive)
-  - If the user data is longer (e.g., "Bachelor of Engineering in Computer Science") and options are shorter (e.g., "BS"), choose the CLOSEST MATCH based on meaning
-- For text fields: Keep responses concise and relevant
-- Match options exactly as they appear in the options list (case-sensitive) when options is not None
-- After filling the form, if a field for save and continue is present, respond with yes to save the form
-
-SPECIAL HANDLING FOR SKILLS/MULTI-VALUE FIELDS:
-- For fields related to skills, technologies, competencies, or any field that should contain multiple items:
-  - Return an ARRAY of strings instead of a single comma-separated string
-  - Each skill/technology should be a separate string in the array
-  - Example: ["C#", "TypeScript", "Java", "SQL", "HTML5", "CSS3", "Python"] instead of "C#, TypeScript, Java, SQL, HTML5, CSS3, Python"
-- Identify skills fields by keywords in the question like: "skills", "technologies", "competencies", "tools", "programming languages", etc.
-
-Data from User Profile:
-{json.dumps(current_data, indent=2)}
-
-Form Fields:
-{json.dumps(form_fields, indent=2)}
-
-Example response format:
-{{
-  "[School or University*, unknown, text, Education-(Optional)-2-panel, input]": "University Name",
-  "[Degree*, unknown, button, Education-(Optional)-2-panel, button]": "MS",
-  "[Field of Study, unknown, unknown, Education-(Optional)-2-panel, input]": "Computer Science",
-  "[Type to Add Skills, unknown, unknown, Skills-section, input]": ["C#", "TypeScript", "Java", "SQL", "HTML5", "CSS3", "Python", ".NET Core", "Angular 2+", "RxJS", "Entity Framework", "React", "Redux", "Bootstrap 4"]
-}}
-
-Respond ONLY with a valid JSON object using the exact "full_key" values as keys.
-"""
-            
-            response = await self.client.chat.completions.create(
-                model="o4-mini",
-                messages=[{"role": "user", "content": prompt}]
-            )
-            content = response.choices[0].message.content.strip()
-            
-            # Clean up the response to extract JSON
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.endswith("```"):
-                content = content[:-3]
-            
-            ai_response = json.loads(content)
-            return ai_response, key_mapping
-            
-        except Exception as e:
-            print(f"Error in get_ai_response_for_section: {e}")
-            return {}, {}
-
-    async def _get_ai_response_for_section(self, current_data: Dict[str, Any], panel_elements: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Get AI response for form fields using OpenAI"""
-        try:
-            form_fields = []
-            key_mapping = {}
-
-            for el in panel_elements:
-                full_key = f"[{el['question']}, {el['input_id']}, {el['input_type']}, {el['aria_labelledby']}, {el['input_tag']}]"
-                
-                form_fields.append({
-                    "full_key": full_key,
-                    "question": el['question'],
-                    "input_id": el['input_id'],
-                    "input_type": el['input_type'],
-                    "input_tag": el['input_tag'],
-                    "aria_labelledby": el['aria_labelledby'],
-                    "options": el['options'], 
-                    "placeholder": el.get('placeholder'),
-                    "required": el.get('required'),
-                    "role": el.get('role')
-                })
-                
-                key_mapping[full_key] = el
-
-            prompt = f"""
-You are helping fill a job application form.
-You are mapping user profile data to a web form.
-
-You are given:
-- An Entry from user profile data (JSON)
-- A list of form fields from the application panel (including labels, field types, and available options if there is dropdown for the element)
-
-Return a JSON dictionary mapping the EXACT "full_key" values to appropriate values. Use the user data to fill the values. If a field is not relevant, map it to "SKIP".
-
-CRITICAL: You MUST use the EXACT "full_key" value as the key in your response JSON. Do NOT use just the question text.
-
-IMPORTANT RULES:
-- For language fields asking fluency, use the closest match from the options list even if its not mentioned and make sure to fill all the listboxes about language fluency based on multiple metrics
-- For fields with "options" not None:
-  - You MUST select ONLY from the list of provided OPTIONS (case-sensitive)
-  - If the user data is longer (e.g., "Bachelor of Engineering in Computer Science") and options are shorter (e.g., "BS"), choose the CLOSEST MATCH based on meaning
-  - If no match is appropriate, use "SKIP"
-- For radio_group fields:
-  - You MUST select ONLY necessary options from the provided options list
-  - Choose the option that best matches the user's profile or a reasonable default
-  - Use EXACT text from the options list (case-sensitive)
-- For date fields: Month should be number format (e.g., "01" for January), year should be "YYYY" format
-- For date-related fields (e.g. type="spinbutton" or input_id includes "Month" or "Year"):
-  - Use "MM" format for months (e.g., "01" for January)
-  - Use "YYYY" format for years (e.g., "2022")
-  - Match "start date", "end date", "graduation date", etc., with the corresponding data from user profile
-- Make sure not to skip voluntary disclosure questions about gender, ethnicity, disability, and veteran status and other similar questions
-- For text fields: Keep responses concise and relevant
-- Match options exactly as they appear in the options list (case-sensitive) when options is not None
-- After filling the form, if a field for save and continue is present, respond with yes to save the form
-
-SPECIAL HANDLING FOR SKILLS/MULTI-VALUE FIELDS:
-- For fields related to skills, technologies, competencies, or any field that should contain multiple items:
-  - Return an ARRAY of strings instead of a single comma-separated string
-  - Each skill/technology should be a separate string in the array
-  - Example: ["C#", "TypeScript", "Java", "SQL", "HTML5", "CSS3", "Python"] instead of "C#, TypeScript, Java, SQL, HTML5, CSS3, Python"
-- Identify skills fields by keywords in the question like: "skills", "technologies", "competencies", "tools", "programming languages", etc.
-
-Data from User Profile:
-{json.dumps(current_data, indent=2)}
-
-Form Fields:
-{json.dumps(form_fields, indent=2)}
-
-Example response format:
-{{
-  "[School or University*, unknown, text, Education-(Optional)-2-panel, input]": "University Name",
-  "[Degree*, unknown, button, Education-(Optional)-2-panel, button]": "MS",
-  "[Field of Study, unknown, unknown, Education-(Optional)-2-panel, input]": "Computer Science",
-  "[Type to Add Skills, unknown, unknown, Skills-section, input]": ["C#", "TypeScript", "Java", "SQL", "HTML5", "CSS3", "Python", ".NET Core", "Angular 2+", "RxJS", "Entity Framework", "React", "Redux", "Bootstrap 4"]
-}}
-
-Respond ONLY with a valid JSON object using the exact "full_key" values as keys.
-"""
-            
-            response = await self.client.chat.completions.create(
-                model="o4-mini",
-                messages=[{"role": "user", "content": prompt}]
-            )
-            content = response.choices[0].message.content.strip()
-            
-            # Clean up the response to extract JSON
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.endswith("```"):
-                content = content[:-3]
-            
-            ai_response = json.loads(content)
-            return ai_response, key_mapping
-            
-        except Exception as e:
-            print(f"Error in get_ai_response_for_section: {e}")
-            return {}, {}
+            print(f"Error getting radio option label: {e}")
+            return "Unknown Option"
 
     async def _fill_form_elements(self, ai_response: Dict[str, Any], key_mapping: Dict[str, Any]) -> None:
         """Fill form elements based on AI response"""
@@ -1677,21 +1790,40 @@ Respond ONLY with a valid JSON object using the exact "full_key" values as keys.
     async def _fill_radio_group(self, radio_group_info: Dict[str, Any], response_value: str) -> None:
         """Fill a radio button group by selecting the appropriate option"""
         try:
+            question = radio_group_info.get('question', 'Unknown radio group')
+            input_id = radio_group_info.get('input_id', 'radio_group')
+            
+            # Start timing for this question
+            if question and question != "UNLABELED":
+                self._start_question_timing(question, input_id)
+            
             if response_value == "SKIP":
-                print(f"Skipping radio group {radio_group_info['input_id']} as per AI response")
+                print(f"Skipping radio group {input_id} as per AI response")
+                # End timing for skipped questions
+                if question and question != "UNLABELED":
+                    self._end_question_timing(question, input_id, "SKIP")
                 return
             
             # Record the radio group data
-            question = radio_group_info.get('question', 'Unknown radio group')
             if question and question != "UNLABELED":
-                question_data = {
+                # Log extracted element info
+                element_data = {
                     "question": question,
-                    "tag": "radio_group",
-                    "type": "radio",
+                    "input_id": input_id,
+                    "input_type": "radio",
+                    "input_tag": "radio_group",
+                    "aria_labelledby": radio_group_info.get('aria_labelledby'),
                     "options": radio_group_info.get('options'),
-                    "response_filled": response_value
+                    "placeholder": None,
+                    "required": radio_group_info.get('required'),
+                    "role": "radiogroup"
                 }
-                self.application_data.append(question_data)
+                self.extracted_elements.append(element_data)
+                
+                # Log filled element info (with response)
+                filled_data = element_data.copy()
+                filled_data["response_filled"] = response_value
+                self.filled_elements.append(filled_data)
                 print(f"Recorded radio group data: {question} -> {response_value}")
             
             options = radio_group_info['options']
@@ -1729,29 +1861,110 @@ Respond ONLY with a valid JSON object using the exact "full_key" values as keys.
                 
                 await selected_element.check()
                 print(f"Selected radio option: '{selected_option}'")
+                
+                # End timing for successful radio group selection
+                if question and question != "UNLABELED":
+                    self._end_question_timing(question, input_id, response_value)
             else:
                 print(f"Invalid selection index: {selected_index}")
+                # End timing for failed selection
+                if question and question != "UNLABELED":
+                    self._end_question_timing(question, input_id, f"FAILED: Invalid index {selected_index}")
                 
         except Exception as e:
             print(f"Error filling radio group: {e}")
+            # End timing for exceptions
+            if question and question != "UNLABELED":
+                self._end_question_timing(question, input_id, f"ERROR: {str(e)}")
+
+    async def handle_disability_status_checkboxes(self, section) -> None:
+        """Handle the disability status checkbox group that requires exactly one selection"""
+        print("Processing disability status section")
+        
+        # Find the checkbox container
+        checkbox_group = await section.query_selector('fieldset[data-automation-id="disabilityStatus-CheckboxGroup"]')
+        
+        if not checkbox_group:
+            print("Disability status checkbox group not found")
+            return
+            
+        # Find all checkboxes in the group
+        checkboxes = await checkbox_group.query_selector_all('input[type="checkbox"]')
+        
+        if not checkboxes or len(checkboxes) == 0:
+            print("No checkboxes found in disability status group")
+            return
+            
+        print(f"Found {len(checkboxes)} disability status checkboxes")
+        
+        selected_option = 1
+        
+        # First uncheck all boxes to avoid conflicts
+        for i, checkbox in enumerate(checkboxes):
+            is_checked = await checkbox.is_checked()
+            if is_checked:
+                await checkbox.uncheck()
+                await asyncio.sleep(1)  # Wait for UI to update
+        
+        # Now check the desired option
+        try:
+            # Get the checkbox and its label for better logging
+            checkbox = checkboxes[selected_option]
+            label_element = await checkbox.evaluate('(el) => el.nextElementSibling.nextElementSibling.textContent')
+            
+            # Check the checkbox
+            await checkbox.check()
+            await asyncio.sleep(2)  # Longer wait for page to stabilize
+            
+            # Verify it's checked
+            is_checked = await checkbox.is_checked()
+            if is_checked:
+                print(f"Successfully selected disability option: {label_element}")
+            else:
+                print(f"Failed to select disability option: {label_element}")
+                
+        except Exception as e:
+            print(f"Error selecting disability status checkbox: {str(e)}")
 
     async def _fill_single_element(self, input_el, input_id: str, input_type: str, input_tag: str, response: Any, options: Optional[List[str]] = None, question: str = None) -> None:
         """Fill a single form element"""
         try:
-            # Record the question and response data (skip duplicates)
+            # Start timing for this question if we have a valid question
+            if question and question != "UNLABELED":
+                self._start_question_timing(question, input_id)
+            
+            # Get complete element information for logging
+            group_label, aria_labelledby = await self._get_group_label_and_aria(input_el)
+            placeholder = await input_el.get_attribute('placeholder')
+            required = await input_el.get_attribute('required')
+            role = await input_el.get_attribute('role')
+            
+            # Log extracted element info
+            element_data = {
+                "question": question,
+                "input_id": input_id,
+                "input_type": input_type,
+                "input_tag": input_tag,
+                "aria_labelledby": aria_labelledby,
+                "options": options,
+                "placeholder": placeholder,
+                "required": required,
+                "role": role
+            }
+            self.extracted_elements.append(element_data)
+            
+            # Log filled element info (with response)
             if response != "SKIP" and question and question != "UNLABELED":
-                question_data = {
-                    "question": question,
-                    "tag": input_tag,
-                    "type": input_type,
-                    "options": options if options else None,
-                    "response_filled": response
-                }
-                self.application_data.append(question_data)
+                filled_data = element_data.copy()
+                filled_data["response_filled"] = response
+                self.filled_elements.append(filled_data)
                 print(f"Recorded data: {question} -> {response}")
             
             if response == "SKIP":
                 print(f"Skipping input {input_id} as per AI response")
+                # End timing even for skipped questions
+                if question and question != "UNLABELED":
+                    self._end_question_timing(question, input_id, "SKIP")
                 return
 
             # Handle file uploads
@@ -1806,21 +2019,62 @@ Respond ONLY with a valid JSON object using the exact "full_key" values as keys.
 
             # Handle checkboxes
             if input_type == "checkbox":
-                if response in [True, "true", "yes", "Yes", 1]:
-                    await input_el.check()
-                    print(f"Checked checkbox {input_id}")
+                print("Inside fill single element handling the checkbox")
+                normalized = str(response).strip().lower()
+                truthy_values = {"true", "yes", "1", "y", "on"}
+                falsy_values = {"false", "no", "0", "n", "off"}
+                
+                # Get current state
+                current_state = await input_el.is_checked()
+                desired_state = normalized in truthy_values
+                
+                # Only act if we need to change the state
+                if current_state != desired_state:
+                    max_retries = 3
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            if desired_state:
+                                await input_el.check()
+                            else:
+                                await input_el.uncheck()
+                            
+                            # Wait longer for UI to update
+                            await asyncio.sleep(1.0)
+                            
+                            # Verify the change worked
+                            new_state = await input_el.is_checked()
+                            if new_state == desired_state:
+                                print(f"{'Checked' if desired_state else 'Unchecked'} checkbox {input_id}")
+                                break
+                        except Exception as retry_error:
+                            print(f"Attempt {attempt+1} failed: {retry_error}")
+                            await asyncio.sleep(1.5)  # Longer wait between retries
+                    else:
+                        print(f"Warning: Failed to {'check' if desired_state else 'uncheck'} checkbox {input_id} after {max_retries} attempts")
+                else:
+                    print(f"Checkbox {input_id} already in desired state: {desired_state}")
                 return
 
             # Handle spinbutton (number inputs)
             if input_type == "spinbutton":
+                if isinstance(response, str) and response.isdigit():
+                    response = int(response)
                 await input_el.fill(str(response))
                 print(f"Filled spinbutton {input_id} with: {response}")
                 return
 
             print(f"Unhandled element type: {input_tag}/{input_type} for {input_id}")
 
+            # End timing for successfully processed questions
+            if question and question != "UNLABELED":
+                self._end_question_timing(question, input_id, response)
+
         except Exception as e:
             print(f"Error filling element {input_id}: {e}")
+            # End timing even for failed questions
+            if question and question != "UNLABELED":
+                self._end_question_timing(question, input_id, f"ERROR: {str(e)}")
 
     async def _fill_multi_select_element(self, input_el, input_id: str, response: Any) -> None:
         """Fill multi-select container element (like skills or how did you hear about us)"""
@@ -1922,7 +2176,15 @@ Respond ONLY with a valid JSON object using the exact "full_key" values as keys.
             selected_option = best_match if best_match else prompt_options[0]
             selected_text = await selected_option.text_content()
             
-            await selected_option.click()
+            checkbox_inside = await selected_option.query_selector('input[type="checkbox"]')
+            if checkbox_inside:
+                if(await checkbox_inside.is_checked()):
+                    print(f"Checkbox already checked for option: {selected_text}")
+                else:
+                    await checkbox_inside.check()
+                    print(f"Checked checkbox for option: {selected_text}")
+            else:
+                await selected_option.click()
             print(f"Selected: '{selected_text}' (score: {best_score:.1f})")
             await asyncio.sleep(1)
         else:
@@ -2014,8 +2276,9 @@ Respond ONLY with a valid JSON object using the exact "full_key" values as keys.
     async def _fill_listbox_element(self, input_el, response: str) -> None:
         """Fill a listbox/combobox element"""
         try:
+            await asyncio.sleep(0.1)
             await input_el.click()
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.7)
             
             listbox = await self.page.query_selector('div[visibility="opened"]')
             if listbox:
@@ -2025,6 +2288,7 @@ Respond ONLY with a valid JSON object using the exact "full_key" values as keys.
                     if text and (text.lower() == response.lower() or response.lower() in text.lower()):
                         await li.click()
                         print(f"Selected option: {text}")
+                        await asyncio.sleep(0.5)
                         return True
                         
                     # Check nested div elements
@@ -2071,24 +2335,67 @@ Respond ONLY with a valid JSON object using the exact "full_key" values as keys.
             return False
 
     def save_application_data(self) -> str:
-        """Save collected application data to JSON file"""
+        """Save collected application data to JSON files"""
         try:
-            filename = f"final_application_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            filepath = self.current_run_dir / filename
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             
-            # Create a summary of the data
-            summary = {
+            # Save extracted elements (all elements found)
+            extracted_filename = f"{self.company}_extracted_elements_{timestamp}_run{self.run_number:03d}.json"
+            extracted_filepath = self.current_run_dir / extracted_filename
+            
+            extracted_summary = {
                 "timestamp": datetime.now().isoformat(),
-                "total_questions": len(self.application_data),
-                "application_data": self.application_data
+                "company": self.company,
+                "url" : self.url,
+                "run_number": self.run_number,
+                "total_extracted_elements": len(self.extracted_elements),
+                "extracted_elements": self.extracted_elements
             }
             
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(summary, f, indent=2, ensure_ascii=False)
+            with open(extracted_filepath, 'w', encoding='utf-8') as f:
+                json.dump(extracted_summary, f, indent=2, ensure_ascii=False)
             
-            print(f"Application data saved to: {filepath}")
-            print(f"Total questions recorded: {len(self.application_data)}")
-            return str(filepath)
+            # Save filled elements (elements with responses)
+            filled_filename = f"{self.company}_filled_elements_{timestamp}_run{self.run_number:03d}.json"
+            filled_filepath = self.current_run_dir / filled_filename
+            
+            # Get timing summary
+            timing_summary = self.get_timing_summary()
+            
+            filled_summary = {
+                "timestamp": datetime.now().isoformat(),
+                "company": self.company,
+                "run_number": self.run_number,
+                "total_extracted_elements": len(self.extracted_elements),
+                "total_filled_elements": len(self.filled_elements),
+                "timing_profile": timing_summary,  # Add timing information
+                "extracted_elements": self.extracted_elements,
+                "filled_elements": self.filled_elements
+            }
+            
+            # Also save a separate timing report
+            timing_filename = f"{self.company}_timing_profile_{timestamp}_run{self.run_number:03d}.json"
+            timing_filepath = self.current_run_dir / timing_filename
+            
+            with open(timing_filepath, 'w', encoding='utf-8') as f:
+                json.dump(timing_summary, f, indent=2, ensure_ascii=False)
+            
+            with open(filled_filepath, 'w', encoding='utf-8') as f:
+                json.dump(filled_summary, f, indent=2, ensure_ascii=False)
+            
+            print(f"Extracted elements saved to: {extracted_filepath}")
+            print(f"Filled elements saved to: {filled_filepath}")
+            print(f"Timing profile saved to: {timing_filepath}")
+            print(f"Company: {self.company}")
+            print(f"Run number: {self.run_number}")
+            print(f"Total extracted elements: {len(self.extracted_elements)}")
+            print(f"Total filled elements: {len(self.filled_elements)}")
+            print(f"Total questions with timing: {timing_summary['total_questions']}")
+            if timing_summary['total_questions'] > 0:
+                print(f"Average time per question: {timing_summary['average_time_readable']}")
+                print(f"Total time spent on questions: {timing_summary['total_time_readable']}")
+            
+            return str(filled_filepath)
             
         except Exception as e:
             print(f"Error saving application data: {e}")
